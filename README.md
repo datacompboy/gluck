@@ -18,7 +18,7 @@ Simple quick hack to upload output from libreview.com into GoogleFit.
 
 ## Install dependencies
 
-- `apt get install jq curl`
+- `apt install jq curl`
 
 ## Configure libreview.com
 
