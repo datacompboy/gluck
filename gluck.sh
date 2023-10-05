@@ -11,20 +11,22 @@ fi
 INPUT=$1
 
 APP_SCOPE=""
+DEL=""
 for scope in blood_glucose nutrition; do
-    if [[ -n "${APP_SCOPE}" ]]; then APP_SCOPE="$APP_SCOPE+"; fi
-    APP_SCOPE="${APP_SCOPE}https://www.googleapis.com/auth/fitness.$scope.read+"
-    APP_SCOPE="${APP_SCOPE}https://www.googleapis.com/auth/fitness.$scope.write"
+    APP_SCOPE="${APP_SCOPE}${DEL}https://www.googleapis.com/auth/fitness.$scope.read"
+    DEL="+"
+    APP_SCOPE="${APP_SCOPE}${DEL}https://www.googleapis.com/auth/fitness.$scope.write"
 done
 loadsecret
 AUTH=$(oauth)
 
 createds() {
-	DATASOURCE="raw:com.google.blood_glucose:$_secret_project_number:Gluck"
-	#curl -X DELETE -H "Authorization: Bearer $AUTH" https://www.googleapis.com/fitness/v1/users/me/dataSources/$DATASOURCE
-	curl -s -H "Authorization: Bearer $AUTH" https://www.googleapis.com/fitness/v1/users/me/dataSources | grep $DATASOURCE > /dev/null 2>&1
-	if [[ $? -ne 0 ]]; then
-		read -r -d '' DATASOURCE << EOM
+    local DATATYPE=$1
+    local DATASOURCE="raw:$DATATYPE:$_secret_project_number:Gluck"
+    #curl -X DELETE -H "Authorization: Bearer $AUTH" https://www.googleapis.com/fitness/v1/users/me/dataSources/$DATASOURCE
+    curl -s -H "Authorization: Bearer $AUTH" https://www.googleapis.com/fitness/v1/users/me/dataSources | grep $DATASOURCE > /dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        read -r -d '' DATASOURCE << EOM
 {
   "dataStreamId": "$DATASOURCE",
   "dataStreamName": "Gluck",
@@ -35,70 +37,137 @@ createds() {
     "version": "1"
   },
   "dataType": {
-    "name": "com.google.blood_glucose"
+    "name": "$DATATYPE"
    }
 }
 EOM
-		curl -s -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json;encoding=utf-8" --data-raw "$DATASOURCE" \
-			https://www.googleapis.com/fitness/v1/users/me/dataSources | jq -r ".dataStreamId"
-	else
-		echo $DATASOURCE
-	fi
+        curl -s -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json;encoding=utf-8" --data-raw "$DATASOURCE" \
+            https://www.googleapis.com/fitness/v1/users/me/dataSources | jq -r ".dataStreamId"
+    else
+        echo $DATASOURCE
+    fi
+}
+createds_glucose() {
+    createds "com.google.blood_glucose"
+}
+createds_food() {
+    createds "com.google.nutrition"
 }
 
-DATASOURCE=$(createds)
-echo "Datasource: $DATASOURCE"
+GLUSRC=$(createds_glucose)
+FOOSRC=$(createds_food)
 
-formatdataarr() {
-    echo $1 | jq -c 'map({"startTimeNanos":.ts,"endTimeNanos":.ts,"dataTypeName":"com.google.blood_glucose","value":[{"fpVal":.v}]})'
-}
-formatdataline() {
-    TSNS=$1
-    VAL=$2
+format_glu() {
+    local TSNS=$1
+    local VAL=$2
     echo '{"startTimeNanos":'$TSNS',"endTimeNanos":'$TSNS',"dataTypeName":"com.google.blood_glucose","value":[{"fpVal":'$VAL'},{},{},{},{}]}'
+}
+format_food() {
+    local TSNS=$1
+    local VAL
+    printf -v VAL "%q" "$2"
+    echo '{"startTimeNanos":'$TSNS',"endTimeNanos":'$TSNS',"dataTypeName":"com.google.nutrition","value":[{"mapVal":[{}]},{},{"stringVal":"'$VAL'"}]}'
 }
 
 replaceday() {
-    DAY=$1
-    MINTS=$2
-    #POINTS=$(formatdataarr $3)
-    POINTS=$3
-    MODE="Full"
-    DAY0="$(date -d "$DAY 00:00:00 UTC" -u "+%s")000000000"
-    DAYE="$(date -d "$DAY 23:59:59 UTC" -u "+%s")999999999"
-    if [[ $(( MINTS - DAY0 )) -gt $(( 10 * 60 * 1000 * 1000 * 1000 )) ]]; then
-        MODE="Partial"
-        DAY0=$MINTS
+    local DS=$1
+    local DAY=$2
+    local MINTS=$3
+    local POINTS=$4
+    local MODE=$5
+    local DAY0="$(date -d "$DAY 00:00:00 UTC" -u "+%s")000000000"
+    local DAYE="$(date -d "$DAY 23:59:59 UTC" -u "+%s")999999999"
+    if [[ -z $MODE ]]; then
+        if [[ $(( MINTS - DAY0 )) -gt $(( 10 * 60 * 1000 * 1000 * 1000 )) ]]; then
+            MODE="Partial"
+            DAY0=$MINTS
+        else
+            MODE="Full"
+        fi
+    else
+        MODE="Full"
     fi
-    echo "$MODE $DAY: $DAY0..$DAYE..." # $DATA"
+    echo "$MODE $DAY: $DAY0..$DAYE..."
 
-    DATA='{"minStartTimeNs":'$DAY0',"maxEndTimeNs":'$DAYE',"dataSourceId":"'$DATASOURCE'","point":'$POINTS'}'
-    DATASET="https://www.googleapis.com/fitness/v1/users/me/dataSources/$DATASOURCE/datasets/$DAY0-$DAYE"
-	curl -s -X DELETE -H "Authorization: Bearer $AUTH" "$DATASET" | head -n 3
-    curl -s -X PATCH -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json;encoding=utf-8"  --data-raw "$DATA" "$DATASET" | head -n 3
+    local DATA='{"minStartTimeNs":'$DAY0',"maxEndTimeNs":'$DAYE',"dataSourceId":"'$DS'","point":'$POINTS'}'
+    local DATASET="https://www.googleapis.com/fitness/v1/users/me/dataSources/$DS/datasets/$DAY0-$DAYE"
+    curl -s -X DELETE -H "Authorization: Bearer $AUTH" "$DATASET" | grep -A 10 '"error"'
+    curl -s -X PATCH -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json;encoding=utf-8"  --data-raw "$DATA" "$DATASET" | grep -A 10 '"error"'
 }
 
 ODATE=""
-while IFS="," read -r _ _ INTS RT VAL _; do
-    if [[ $RT == "0" ]]; then
-        DATE=$(date -d "$INTS $CSVTZ" -u "+%F")
-        TSNS="$(date -d "$INTS $CSVTZ" -u "+%s")000000000"
-       
-        if [[ "$DATE" != "$ODATE" ]]; then
-            if [[ -n "$ODATE" ]]; then
-                replaceday $ODATE $MINTS "$DATA]"
-            fi
-            ODATE=$DATE
-            MINTS=$TSNS
-            DATA=""
-        fi
+DATA=""
+OK=""
+
+handle_line() {
+    local INTS=$1
+    local RT=$2
+    local VAL=$3
+    local FOOD=$4
+
+    DATE=$(date -d "$INTS $CSVTZ" -u "+%F")
+    TSNS="$(date -d "$INTS $CSVTZ" -u "+%s")000000000"
+    if [[ "$DATE" != "$ODATE" ]]; then
         if [[ -n "$DATA" ]]; then
-            #DATA="$DATA,{\"ts\":$TSNS,\"v\":$VAL}"
-            DATA="$DATA,$(formatdataline $TSNS $VAL)"
-        else
-            DATA="[$(formatdataline $TSNS $VAL)"
+            replaceday $DS $ODATE $MINTS "$DATA]" $MODE
+        fi
+        ODATE=$DATE
+        MINTS=$TSNS
+        DATA=""
+        DEL="["
+        MODE=""
+    fi
+
+    # 5min measurements
+    if [[ $RT == "0" ]]; then
+        DS=$GLUSRC
+        MODE=""
+        DATA="$DATA$DEL$(format_glu "$TSNS" "$VAL")"
+        DEL=","
+    fi
+    # 1 = look-at-data points
+    # 6 = comments
+    if [[ $RT == "6" ]]; then
+        DS=$FOOSRC
+        DATA="$DATA$DEL$(format_food "$TSNS" "$FOOD")"
+        DEL=","
+        MODE="Full"
+    fi
+}
+
+PINTS=""
+while IFS="," read -r _ _ INTS RT VAL _ _ _ _ _ _ _ _ FOOD; do
+    if [[ -z "$OK" ]]; then
+        if [[ "$VAL" != "Historic Glucose mmol/L" ]]; then
+            echo "Please set English in libreview.com profile settings and download new csv"
+            echo "'$VAL' should be equals to 'Historic Glucose mmol/L'"
+            exit 1
+        fi
+        OK="ok"
+        continue
+    fi
+    FOOD=${FOOD%%,,,,,*}
+    if [[ -n $PINTS ]]; then
+        # Suppress Excercise lines and optional same-second comment
+        if [[ "$PINTS" == "$INTS" && ( "$FOOD" == "Exercise" || "$PFOOD" == "Exercise" ) ]]; then
+            # Skip both lines
+            PINTS=""
+            continue
+        fi
+        # Skip Exercise line if it's alone
+        if [[ "$PFOOD" != "Exercise" ]]; then
+            handle_line "$PINTS" "$PRT" "$PVAL" "$PFOOD"
         fi
     fi
+    PINTS=$INTS
+    PRT=$RT
+    PVAL=$VAL
+    PFOOD=$FOOD
 done < <(tail -n +2 $INPUT)
-replaceday $DATE $MINTS "$DATA]"
+if [[ -n "$PINTS" && "$PFOOD" != "Exercise" ]]; then
+    handle_line "$PINTS" "$PRT" "$PVAL" "$PFOOD"
+fi
+if [[ -n $DATA ]]; then
+    replaceday $DS $DATE $MINTS "$DATA]" $MODE
+fi
 
